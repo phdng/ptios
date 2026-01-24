@@ -8,11 +8,18 @@
 #include "headers/IOSurface/CoreSurface.h"
 #import <Photos/Photos.h>
 
-OBJC_EXTERN void CARenderServerRenderDisplay(kern_return_t a, CFStringRef b, IOSurfaceRef surface, int x, int y);
+OBJC_EXTERN kern_return_t CARenderServerRenderDisplay(kern_return_t a, CFStringRef b, IOSurfaceRef surface, int x, int y);
 OBJC_EXTERN kern_return_t IOSurfaceLock(IOSurfaceRef buffer, IOSurfaceLockOptions options, uint32_t *seed);
 OBJC_EXTERN kern_return_t IOSurfaceUnLock(IOSurfaceRef buffer, IOSurfaceLockOptions options, uint32_t *seed);
 OBJC_EXTERN IOSurfaceRef IOSurfaceCreate(CFDictionaryRef dictionary);
 OBJC_EXTERN CGImageRef UICreateCGImageFromIOSurface(IOSurfaceRef surface);
+
+#include <dlfcn.h>
+
+// IOMobileFramebuffer function pointers
+typedef void *IOMobileFramebufferRef;
+typedef kern_return_t (*IOMobileFramebufferGetMainDisplay_t)(IOMobileFramebufferRef *connection);
+typedef kern_return_t (*IOMobileFramebufferGetLayerDefaultSurface_t)(IOMobileFramebufferRef connection, int surface, IOSurfaceRef *buffer);
 
 static CGFloat device_screen_width = 0;
 static CGFloat device_screen_height = 0;
@@ -106,107 +113,110 @@ OBJC_EXTERN UIImage *_UICreateScreenUIImage(void);
 
 + (CGImageRef)createScreenShotCGImageRef
 {
-    Boolean isiPad8orUp = false;
+    @autoreleasepool {
+        NSLog(@"com.zjx.springboard: DEBUG: Starting createScreenShotCGImageRef (IOMobileFramebuffer/dlsym/IPC-Fallback Mode V3)");
 
-    CGFloat scale = [UIScreen mainScreen].scale;
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+        static void *iomfbHandle = NULL;
+        static IOMobileFramebufferGetMainDisplay_t IOMobileFramebufferGetMainDisplay = NULL;
+        static IOMobileFramebufferGetLayerDefaultSurface_t IOMobileFramebufferGetLayerDefaultSurface = NULL;
 
-    int height = (int)(screenSize.height * scale);
-    int width = (int)(screenSize.width * scale);
-
-    // check whether it is ipad8 or later
-    NSString *searchText = getDeviceName();
-
-    NSRange range = [searchText rangeOfString:@"^iPad[8-9]|iPad[1-9][0-9]+" options:NSRegularExpressionSearch];
-    if (range.location != NSNotFound) { // ipad pro (3rd) or later
-        isiPad8orUp = true;
-    }
-
-    if (isiPad8orUp)
-    {
-        if (width < height)
-        {
-            int temp = width;
-            width = height;
-            height = temp;
+        if (!iomfbHandle) {
+            iomfbHandle = dlopen("/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/IOMobileFramebuffer", RTLD_LAZY);
+            if (!iomfbHandle) {
+                NSLog(@"com.zjx.springboard: Failed to open IOMobileFramebuffer framework: %s", dlerror());
+                // Fallback to IPC immediately if IOMFB missing
+                return [Screen screenShotFromSpringBoardIPC];
+            }
+            IOMobileFramebufferGetMainDisplay = (IOMobileFramebufferGetMainDisplay_t)dlsym(iomfbHandle, "IOMobileFramebufferGetMainDisplay");
+            IOMobileFramebufferGetLayerDefaultSurface = (IOMobileFramebufferGetLayerDefaultSurface_t)dlsym(iomfbHandle, "IOMobileFramebufferGetLayerDefaultSurface");
         }
-    }
-    else
-    {
-        if (width > height)
-        {
-            int temp = width;
-            width = height;
-            height = temp;
+
+        if (!IOMobileFramebufferGetMainDisplay || !IOMobileFramebufferGetLayerDefaultSurface) {
+            NSLog(@"com.zjx.springboard: Failed to resolve IOMobileFramebuffer symbols");
+            return [Screen screenShotFromSpringBoardIPC];
         }
-    }
 
-    int bytesPerElement = 4;
-    int bytesPerRow = roundUp(bytesPerElement * width, 32);
+        IOMobileFramebufferRef connect = NULL;
+        kern_return_t result = IOMobileFramebufferGetMainDisplay(&connect);
+        if (result != 0 || connect == NULL) {
+            NSLog(@"com.zjx.springboard: IOMobileFramebufferGetMainDisplay failed: %d. Trying IPC fallback...", result);
+            return [Screen screenShotFromSpringBoardIPC];
+        }
 
-    NSNumber *IOSurfaceBytesPerElement = [NSNumber numberWithInteger:bytesPerElement]; 
-    NSNumber *IOSurfaceBytesPerRow = [NSNumber numberWithInteger:bytesPerRow]; // don't know why but it should be a multiple of 32
-    NSNumber *IOSurfaceAllocSize = [NSNumber numberWithInteger:bytesPerRow * height]; 
-    NSNumber *nheight = [NSNumber numberWithInteger:height]; 
-    NSNumber *nwidth = [NSNumber numberWithInteger:width]; 
-    NSNumber *IOSurfacePixelFormat = [NSNumber numberWithInteger:1111970369]; 
-    NSNumber *IOSurfaceIsGlobal = [NSNumber numberWithInteger:1]; 
+        IOSurfaceRef screenSurface = NULL;
+        result = IOMobileFramebufferGetLayerDefaultSurface(connect, 0, &screenSurface);
+        if (result != 0 || screenSurface == NULL) {
+            NSLog(@"com.zjx.springboard: IOMobileFramebufferGetLayerDefaultSurface failed: %d. Trying IPC fallback...", result);
+            return [Screen screenShotFromSpringBoardIPC];
+        }
 
-    NSDictionary *properties = [[NSDictionary alloc] initWithObjectsAndKeys:IOSurfaceAllocSize, @"IOSurfaceAllocSize"
-                                , IOSurfaceBytesPerElement, @"IOSurfaceBytesPerElement", IOSurfaceBytesPerRow, @"IOSurfaceBytesPerRow", nheight, @"IOSurfaceHeight", 
-                                IOSurfaceIsGlobal, @"IOSurfaceIsGlobal", IOSurfacePixelFormat, @"IOSurfacePixelFormat", nwidth, @"IOSurfaceWidth", nil];    
+        NSLog(@"com.zjx.springboard: DEBUG: IOSurface retrieved successfully via IOMobileFramebuffer");
 
-    IOSurfaceRef screenSurface = IOSurfaceCreate((__bridge CFDictionaryRef)(properties));
+        // Lock for reading
+        uint32_t seed = 0;
+        kern_return_t lockResult = IOSurfaceLock(screenSurface, 1, &seed); // 1 = kIOSurfaceLockReadOnly
+        if (lockResult != 0) {
+            NSLog(@"com.zjx.springboard: IOSurfaceLock failed with code: %d", lockResult);
+        }
 
-    properties = nil;
+        CGImageRef cgImageRef = nil;
+        if (screenSurface) {
+            cgImageRef = UICreateCGImageFromIOSurface(screenSurface);
 
-    if (!screenSurface) {
-        NSLog(@"com.zjx.springboard: Failed to create IOSurface.");
-        return nil;
-    }
-    
-    IOSurfaceLock(screenSurface, 0, NULL);
-    CARenderServerRenderDisplay(0, CFSTR("LCD"), screenSurface, 0, 0);
-        
-    CGImageRef cgImageRef = nil;
-    if (screenSurface) {
-        cgImageRef = UICreateCGImageFromIOSurface(screenSurface);
-        int targetWidth = CGImageGetWidth(cgImageRef);
-        int targetHeight = CGImageGetHeight(cgImageRef);
+            // Handle iPad rotation if necessary
+            Boolean isiPad8orUp = false;
+            NSString *searchText = getDeviceName();
+            NSRange range = [searchText rangeOfString:@"^iPad[8-9]|iPad[1-9][0-9]+" options:NSRegularExpressionSearch];
+            if (range.location != NSNotFound) { // ipad pro (3rd) or later
+                isiPad8orUp = true;
+            }
 
-        if (isiPad8orUp) // rotate 90 degrees counterclockwise
-        {
-            CGColorSpaceRef colorSpaceInfo = CGImageGetColorSpace(cgImageRef);
-            CGContextRef bitmap;
+            if (isiPad8orUp) // rotate 90 degrees counterclockwise
+            {
+                int targetWidth = CGImageGetWidth(cgImageRef);
+                int targetHeight = CGImageGetHeight(cgImageRef);
+                CGColorSpaceRef colorSpaceInfo = CGImageGetColorSpace(cgImageRef);
+                CGContextRef bitmap;
 
-            //if (sourceImage.imageOrientation == UIImageOrientationUp || sourceImage.imageOrientation == UIImageOrientationDown) {
                 bitmap = CGBitmapContextCreate(NULL, targetHeight, targetWidth, CGImageGetBitsPerComponent(cgImageRef), CGImageGetBytesPerRow(cgImageRef), colorSpaceInfo, kCGImageAlphaPremultipliedFirst);
-            //} else {
-                //bitmap = CGBitmapContextCreate(NULL, targetHeight, targetWidth, CGImageGetBitsPerComponent(cgImageRef), CGImageGetBytesPerRow(imageRef), colorSpaceInfo, bitmapInfo);
 
-            //}   
+                CGFloat degrees = -90.f;
+                CGFloat radians = degrees * (M_PI / 180.f);
 
-            CGFloat degrees = -90.f;
-            CGFloat radians = degrees * (M_PI / 180.f);
+                CGContextTranslateCTM (bitmap, 0.5*targetHeight, 0.5*targetWidth);
+                CGContextRotateCTM (bitmap, radians);
+                CGContextTranslateCTM (bitmap, -0.5*targetWidth, -0.5*targetHeight);
 
-            CGContextTranslateCTM (bitmap, 0.5*targetHeight, 0.5*targetWidth);
-            CGContextRotateCTM (bitmap, radians);
-            CGContextTranslateCTM (bitmap, -0.5*targetWidth, -0.5*targetHeight);
+                CGContextDrawImage(bitmap, CGRectMake(0, 0, targetWidth, targetHeight), cgImageRef);
 
-            CGContextDrawImage(bitmap, CGRectMake(0, 0, targetWidth, targetHeight), cgImageRef);
-            
-            CGImageRelease(cgImageRef);
-            cgImageRef = CGBitmapContextCreateImage(bitmap);
+                CGImageRelease(cgImageRef);
+                cgImageRef = CGBitmapContextCreateImage(bitmap);
 
-            CGColorSpaceRelease(colorSpaceInfo);
-            CGContextRelease(bitmap);
+                CGColorSpaceRelease(colorSpaceInfo);
+                CGContextRelease(bitmap);
+            }
         }
+        IOSurfaceUnlock(screenSurface, 0, NULL);
+        return cgImageRef;
     }
-    IOSurfaceUnlock(screenSurface, 0, NULL);
-    CFRelease(screenSurface);
-    screenSurface = nil;
+}
 
-    return cgImageRef;
++ (CGImageRef)screenShotFromSpringBoardIPC
+{
+    NSLog(@"com.zjx.springboard: DEBUG: Requesting screenshot from SpringBoard via IPC (Task 29)...");
+    NSString *resp = ZXSendSpringBoardTask(@"29", 3.0); // 3 seconds timeout
+    if (resp && [resp hasPrefix:@"0;;Success"]) {
+        NSString *path = @"/var/mobile/Library/ZXTouch/daemon_screenshot.png";
+        UIImage *img = [UIImage imageWithContentsOfFile:path];
+        if (img) {
+            NSLog(@"com.zjx.springboard: DEBUG: IPC Screenshot success.");
+            return CGImageRetain([img CGImage]);
+        }
+        NSLog(@"com.zjx.springboard: DEBUG: IPC Screenshot file not found or invalid.");
+    } else {
+        NSLog(@"com.zjx.springboard: DEBUG: IPC Screenshot request failed. Response: %@", resp);
+    }
+    return nil;
 }
 
 

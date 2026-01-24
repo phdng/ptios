@@ -249,6 +249,8 @@ static void handleDaemonMessage(UInt8 *buff, CFWriteStreamRef client)
         return;
     }
 
+    NSLog(@"com.zjx.zxtouchd: processing internal task %d", taskType);
+
     @autoreleasepool {
         switch (taskType) {
             case 21: { // TASK_TEMPLATE_MATCH
@@ -264,11 +266,14 @@ static void handleDaemonMessage(UInt8 *buff, CFWriteStreamRef client)
                 break;
             }
             case 23: { // TASK_COLOR_PICKER
+                NSLog(@"com.zjx.zxtouchd: DEBUG: Handling TASK_COLOR_PICKER");
                 NSError *err = nil;
                 NSDictionary *color = getRGBFromRawData(eventData, &err);
                 if (err) {
+                    NSLog(@"com.zjx.zxtouchd: DEBUG: TASK_COLOR_PICKER failed: %@", err);
                     writeCString([[err localizedDescription] UTF8String]);
                 } else {
+                    NSLog(@"com.zjx.zxtouchd: DEBUG: TASK_COLOR_PICKER success: R%@ G%@ B%@", color[@"red"], color[@"green"], color[@"blue"]);
                     NSString *resp = [NSString stringWithFormat:@"0;;%@;;%@;;%@\r\n",
                                       color[@"red"], color[@"green"], color[@"blue"]];
                     writeCString([resp UTF8String]);
@@ -276,11 +281,14 @@ static void handleDaemonMessage(UInt8 *buff, CFWriteStreamRef client)
                 break;
             }
             case 27: { // TASK_TEXT_RECOGNIZER
+                NSLog(@"com.zjx.zxtouchd: DEBUG: Handling TASK_TEXT_RECOGNIZER");
                 NSError *err = nil;
                 NSString *result = performTextRecognizerTextFromRawData(eventData, &err);
                 if (err) {
+                    NSLog(@"com.zjx.zxtouchd: DEBUG: TASK_TEXT_RECOGNIZER failed: %@", err);
                     writeCString([[err localizedDescription] UTF8String]);
                 } else {
+                    NSLog(@"com.zjx.zxtouchd: DEBUG: TASK_TEXT_RECOGNIZER success");
                     NSString *resp = [NSString stringWithFormat:@"0;;%@\r\n", result ?: @""];
                     writeCString([resp UTF8String]);
                 }

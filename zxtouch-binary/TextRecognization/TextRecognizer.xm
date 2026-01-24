@@ -68,7 +68,49 @@ NSString* performTextRecognizerTextFromRawData(UInt8* eventData, NSError** error
         NSArray *languages = [languagesData componentsSeparatedByString:@",,"];
 
         // screen shot
-        CGImageRef screenshot = [Screen createScreenShotCGImageRef];
+        NSLog(@"com.zjx.springboard: DEBUG: Capturing screenshot for OCR...");
+        CGImageRef screenshotRaw = [Screen createScreenShotCGImageRef];
+
+        if (!screenshotRaw) {
+             NSLog(@"com.zjx.springboard: Failed to capture screenshot for OCR.");
+             if (error) {
+                *error = [NSError errorWithDomain:@"com.zjx.zxtouchsp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;Failed to capture screenshot for OCR.\r\n"}];
+             }
+            return nil;
+        }
+        NSLog(@"com.zjx.springboard: DEBUG: Screenshot captured for OCR. Size: %zux%zu", CGImageGetWidth(screenshotRaw), CGImageGetHeight(screenshotRaw));
+
+        // Deep copy to decouple from IOSurface to prevent freezing
+        size_t width = CGImageGetWidth(screenshotRaw);
+        size_t height = CGImageGetHeight(screenshotRaw);
+
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGBitmapInfo bitmapInfo = kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big;
+
+        CGContextRef context = CGBitmapContextCreate(NULL, width, height, 8, 0, colorSpace, bitmapInfo);
+        CGColorSpaceRelease(colorSpace);
+
+        CGImageRef screenshot = nil;
+        if (context) {
+            NSLog(@"com.zjx.springboard: DEBUG: Deep copying OCR screenshot...");
+            CGContextDrawImage(context, CGRectMake(0, 0, width, height), screenshotRaw);
+            screenshot = CGBitmapContextCreateImage(context);
+            CGContextRelease(context);
+            CFRelease(screenshotRaw);
+            NSLog(@"com.zjx.springboard: DEBUG: Deep copy complete.");
+        } else {
+            // Fallback if context creation fails (e.g. OOM), though this risks the original issue.
+            NSLog(@"com.zjx.springboard: DEBUG: Failed to create bitmap context for deep copy. Using raw image.");
+            screenshot = screenshotRaw;
+        }
+
+        if (!screenshot) {
+             NSLog(@"com.zjx.springboard: Failed to create screenshot copy for OCR.");
+             if (error) {
+                *error = [NSError errorWithDomain:@"com.zjx.zxtouchsp" code:999 userInfo:@{NSLocalizedDescriptionKey:@"-1;;Failed to create screenshot copy for OCR.\r\n"}];
+             }
+            return nil;
+        }
 
         int orientation = [Screen getScreenOrientation];
 
